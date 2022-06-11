@@ -60,9 +60,14 @@ func (a *App) List(ctx context.Context, limit int, exporter cmdutil.Exporter) er
 		return exporter.Write(a.io, codespaces)
 	}
 
+	if len(codespaces) == 0 {
+		return cmdutil.NewNoResultsError("no codespaces found")
+	}
+
 	tp := utils.NewTablePrinter(a.io)
 	if tp.IsTTY() {
 		tp.AddField("NAME", nil, nil)
+		tp.AddField("DISPLAY NAME", nil, nil)
 		tp.AddField("REPOSITORY", nil, nil)
 		tp.AddField("BRANCH", nil, nil)
 		tp.AddField("STATE", nil, nil)
@@ -98,6 +103,7 @@ func (a *App) List(ctx context.Context, limit int, exporter cmdutil.Exporter) er
 		}
 
 		tp.AddField(formattedName, nil, nameColor)
+		tp.AddField(c.DisplayName, nil, nil)
 		tp.AddField(c.Repository.FullName, nil, nil)
 		tp.AddField(c.branchWithGitStatus(), nil, cs.Cyan)
 		if c.PendingOperation {

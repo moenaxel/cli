@@ -33,7 +33,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -115,7 +114,7 @@ func (a *API) GetUser(ctx context.Context) (*User, error) {
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -153,7 +152,7 @@ func (a *API) GetRepository(ctx context.Context, nwo string) (*Repository, error
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -183,6 +182,8 @@ type Codespace struct {
 	VSCSTarget                     string              `json:"vscs_target"`
 	PendingOperation               bool                `json:"pending_operation"`
 	PendingOperationDisabledReason string              `json:"pending_operation_disabled_reason"`
+	IdleTimeoutNotice              string              `json:"idle_timeout_notice"`
+	WebURL                         string              `json:"web_url"`
 }
 
 type CodespaceGitStatus struct {
@@ -197,8 +198,8 @@ type CodespaceMachine struct {
 	Name            string `json:"name"`
 	DisplayName     string `json:"display_name"`
 	OperatingSystem string `json:"operating_system"`
-	StorageInBytes  int    `json:"storage_in_bytes"`
-	MemoryInBytes   int    `json:"memory_in_bytes"`
+	StorageInBytes  uint64 `json:"storage_in_bytes"`
+	MemoryInBytes   uint64 `json:"memory_in_bytes"`
 	CPUCount        int    `json:"cpus"`
 }
 
@@ -364,7 +365,7 @@ func (a *API) GetCodespace(ctx context.Context, codespaceName string, includeCon
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -432,40 +433,6 @@ func (a *API) StopCodespace(ctx context.Context, codespaceName string) error {
 	return nil
 }
 
-type getCodespaceRegionLocationResponse struct {
-	Current string `json:"current"`
-}
-
-// GetCodespaceRegionLocation returns the closest codespace location for the user.
-func (a *API) GetCodespaceRegionLocation(ctx context.Context) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, a.vscsAPI+"/api/v1/locations", nil)
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %w", err)
-	}
-
-	resp, err := a.do(ctx, req, req.URL.String())
-	if err != nil {
-		return "", fmt.Errorf("error making request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", api.HandleHTTPError(resp)
-	}
-
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("error reading response body: %w", err)
-	}
-
-	var response getCodespaceRegionLocationResponse
-	if err := json.Unmarshal(b, &response); err != nil {
-		return "", fmt.Errorf("error unmarshaling response: %w", err)
-	}
-
-	return response.Current, nil
-}
-
 type Machine struct {
 	Name                 string `json:"name"`
 	DisplayName          string `json:"display_name"`
@@ -496,7 +463,7 @@ func (a *API) GetCodespacesMachines(ctx context.Context, repoID int, branch, loc
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -591,14 +558,16 @@ func (a *API) GetCodespaceRepoSuggestions(ctx context.Context, partialSearch str
 
 // CreateCodespaceParams are the required parameters for provisioning a Codespace.
 type CreateCodespaceParams struct {
-	RepositoryID       int
-	IdleTimeoutMinutes int
-	Branch             string
-	Machine            string
-	Location           string
-	VSCSTarget         string
-	VSCSTargetURL      string
-	PermissionsOptOut  bool
+	RepositoryID           int
+	IdleTimeoutMinutes     int
+	RetentionPeriodMinutes *int
+	Branch                 string
+	Machine                string
+	Location               string
+	DevContainerPath       string
+	VSCSTarget             string
+	VSCSTargetURL          string
+	PermissionsOptOut      bool
 }
 
 // CreateCodespace creates a codespace with the given parameters and returns a non-nil error if it
@@ -639,14 +608,16 @@ func (a *API) CreateCodespace(ctx context.Context, params *CreateCodespaceParams
 }
 
 type startCreateRequest struct {
-	RepositoryID       int    `json:"repository_id"`
-	IdleTimeoutMinutes int    `json:"idle_timeout_minutes,omitempty"`
-	Ref                string `json:"ref"`
-	Location           string `json:"location"`
-	Machine            string `json:"machine"`
-	VSCSTarget         string `json:"vscs_target,omitempty"`
-	VSCSTargetURL      string `json:"vscs_target_url,omitempty"`
-	PermissionsOptOut  bool   `json:"devcontainer_permissions_opt_out"`
+	RepositoryID           int    `json:"repository_id"`
+	IdleTimeoutMinutes     int    `json:"idle_timeout_minutes,omitempty"`
+	RetentionPeriodMinutes *int   `json:"retention_period_minutes,omitempty"`
+	Ref                    string `json:"ref"`
+	Location               string `json:"location"`
+	Machine                string `json:"machine"`
+	DevContainerPath       string `json:"devcontainer_path,omitempty"`
+	VSCSTarget             string `json:"vscs_target,omitempty"`
+	VSCSTargetURL          string `json:"vscs_target_url,omitempty"`
+	PermissionsOptOut      bool   `json:"multi_repo_permissions_opt_out"`
 }
 
 var errProvisioningInProgress = errors.New("provisioning in progress")
@@ -670,14 +641,16 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 	}
 
 	requestBody, err := json.Marshal(startCreateRequest{
-		RepositoryID:       params.RepositoryID,
-		IdleTimeoutMinutes: params.IdleTimeoutMinutes,
-		Ref:                params.Branch,
-		Location:           params.Location,
-		Machine:            params.Machine,
-		VSCSTarget:         params.VSCSTarget,
-		VSCSTargetURL:      params.VSCSTargetURL,
-		PermissionsOptOut:  params.PermissionsOptOut,
+		RepositoryID:           params.RepositoryID,
+		IdleTimeoutMinutes:     params.IdleTimeoutMinutes,
+		RetentionPeriodMinutes: params.RetentionPeriodMinutes,
+		Ref:                    params.Branch,
+		Location:               params.Location,
+		Machine:                params.Machine,
+		DevContainerPath:       params.DevContainerPath,
+		VSCSTarget:             params.VSCSTarget,
+		VSCSTargetURL:          params.VSCSTargetURL,
+		PermissionsOptOut:      params.PermissionsOptOut,
 	})
 
 	if err != nil {
@@ -705,7 +678,7 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 			r        = io.TeeReader(resp.Body, bodyCopy)
 		)
 
-		b, err := ioutil.ReadAll(r)
+		b, err := io.ReadAll(r)
 		if err != nil {
 			return nil, fmt.Errorf("error reading response body: %w", err)
 		}
@@ -717,7 +690,7 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 			return nil, ue
 		}
 
-		resp.Body = ioutil.NopCloser(bodyCopy)
+		resp.Body = io.NopCloser(bodyCopy)
 
 		return nil, api.HandleHTTPError(resp)
 
@@ -725,7 +698,7 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -759,6 +732,73 @@ func (a *API) DeleteCodespace(ctx context.Context, codespaceName string) error {
 	return nil
 }
 
+type DevContainerEntry struct {
+	Path string `json:"path"`
+	Name string `json:"name,omitempty"`
+}
+
+// ListDevContainers returns a list of valid devcontainer.json files for the repo. Pass a negative limit to request all pages from
+// the API until all devcontainer.json files have been fetched.
+func (a *API) ListDevContainers(ctx context.Context, repoID int, branch string, limit int) (devcontainers []DevContainerEntry, err error) {
+	perPage := 100
+	if limit > 0 && limit < 100 {
+		perPage = limit
+	}
+
+	v := url.Values{}
+	v.Set("per_page", strconv.Itoa(perPage))
+	if branch != "" {
+		v.Set("ref", branch)
+	}
+	listURL := fmt.Sprintf("%s/repositories/%d/codespaces/devcontainers?%s", a.githubAPI, repoID, v.Encode())
+
+	for {
+		req, err := http.NewRequest(http.MethodGet, listURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("error creating request: %w", err)
+		}
+		a.setHeaders(req)
+
+		resp, err := a.do(ctx, req, fmt.Sprintf("/repositories/%d/codespaces/devcontainers", repoID))
+		if err != nil {
+			return nil, fmt.Errorf("error making request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, api.HandleHTTPError(resp)
+		}
+
+		var response struct {
+			Devcontainers []DevContainerEntry `json:"devcontainers"`
+		}
+
+		dec := json.NewDecoder(resp.Body)
+		if err := dec.Decode(&response); err != nil {
+			return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		}
+
+		nextURL := findNextPage(resp.Header.Get("Link"))
+		devcontainers = append(devcontainers, response.Devcontainers...)
+
+		if nextURL == "" || (limit > 0 && len(devcontainers) >= limit) {
+			break
+		}
+
+		if newPerPage := limit - len(devcontainers); limit > 0 && newPerPage < 100 {
+			u, _ := url.Parse(nextURL)
+			q := u.Query()
+			q.Set("per_page", strconv.Itoa(newPerPage))
+			u.RawQuery = q.Encode()
+			listURL = u.String()
+		} else {
+			listURL = nextURL
+		}
+	}
+
+	return devcontainers, nil
+}
+
 type EditCodespaceParams struct {
 	DisplayName        string `json:"display_name,omitempty"`
 	IdleTimeoutMinutes int    `json:"idle_timeout_minutes,omitempty"`
@@ -767,7 +807,6 @@ type EditCodespaceParams struct {
 
 func (a *API) EditCodespace(ctx context.Context, codespaceName string, params *EditCodespaceParams) (*Codespace, error) {
 	requestBody, err := json.Marshal(params)
-
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request: %w", err)
 	}
@@ -778,7 +817,7 @@ func (a *API) EditCodespace(ctx context.Context, codespaceName string, params *E
 	}
 
 	a.setHeaders(req)
-	resp, err := a.do(ctx, req, "/user/codespaces")
+	resp, err := a.do(ctx, req, "/user/codespaces/*")
 	if err != nil {
 		return nil, fmt.Errorf("error making request: %w", err)
 	}
@@ -802,7 +841,7 @@ func (a *API) EditCodespace(ctx context.Context, codespaceName string, params *E
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -850,7 +889,7 @@ func (a *API) GetCodespaceRepositoryContents(ctx context.Context, codespace *Cod
 		return nil, api.HandleHTTPError(resp)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
@@ -886,7 +925,7 @@ func (a *API) AuthorizedKeys(ctx context.Context, user string) ([]byte, error) {
 		return nil, fmt.Errorf("server returned %s", resp.Status)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}

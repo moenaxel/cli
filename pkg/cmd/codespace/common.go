@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"sort"
@@ -15,9 +14,12 @@ import (
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/AlecAivazis/survey/v2/terminal"
+	"github.com/cli/cli/v2/internal/codespaces"
 	"github.com/cli/cli/v2/internal/codespaces/api"
 	"github.com/cli/cli/v2/pkg/iostreams"
+	"github.com/cli/cli/v2/pkg/liveshare"
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
 
@@ -59,6 +61,48 @@ func (a *App) StopProgressIndicator() {
 	a.io.StopProgressIndicator()
 }
 
+type liveshareSession interface {
+	Close() error
+	GetSharedServers(context.Context) ([]*liveshare.Port, error)
+	KeepAlive(string)
+	OpenStreamingChannel(context.Context, liveshare.ChannelID) (ssh.Channel, error)
+	StartJupyterServer(context.Context) (int, string, error)
+	StartSharing(context.Context, string, int) (liveshare.ChannelID, error)
+	StartSSHServer(context.Context) (int, string, error)
+}
+
+// Connects to a codespace using Live Share and returns that session
+func startLiveShareSession(ctx context.Context, codespace *api.Codespace, a *App, debug bool, debugFile string) (session liveshareSession, err error) {
+	// While connecting, ensure in the background that the user has keys installed.
+	// That lets us report a more useful error message if they don't.
+	authkeys := make(chan error, 1)
+	go func() {
+		authkeys <- checkAuthorizedKeys(ctx, a.apiClient)
+	}()
+
+	liveshareLogger := noopLogger()
+	if debug {
+		debugLogger, err := newFileLogger(debugFile)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't create file logger: %w", err)
+		}
+		defer safeClose(debugLogger, &err)
+
+		liveshareLogger = debugLogger.Logger
+		a.errLogger.Printf("Debug file located at: %s", debugLogger.Name())
+	}
+
+	session, err = codespaces.ConnectToLiveshare(ctx, a, liveshareLogger, a.apiClient, codespace)
+	if err != nil {
+		if authErr := <-authkeys; authErr != nil {
+			return nil, fmt.Errorf("failed to fetch authorization keys: %w", authErr)
+		}
+		return nil, fmt.Errorf("failed to connect to Live Share: %w", err)
+	}
+
+	return session, nil
+}
+
 //go:generate moq -fmt goimports -rm -skip-ensure -out mock_api.go . apiClient
 type apiClient interface {
 	GetUser(ctx context.Context) (*api.User, error)
@@ -71,9 +115,9 @@ type apiClient interface {
 	EditCodespace(ctx context.Context, codespaceName string, params *api.EditCodespaceParams) (*api.Codespace, error)
 	GetRepository(ctx context.Context, nwo string) (*api.Repository, error)
 	AuthorizedKeys(ctx context.Context, user string) ([]byte, error)
-	GetCodespaceRegionLocation(ctx context.Context) (string, error)
 	GetCodespacesMachines(ctx context.Context, repoID int, branch, location string) ([]*api.Machine, error)
 	GetCodespaceRepositoryContents(ctx context.Context, codespace *api.Codespace, path string) ([]byte, error)
+	ListDevContainers(ctx context.Context, repoID int, branch string, limit int) (devcontainers []api.DevContainerEntry, err error)
 	GetCodespaceRepoSuggestions(ctx context.Context, partialSearch string, params api.RepoSearchParameters) ([]string, error)
 }
 
@@ -106,6 +150,7 @@ func chooseCodespaceFromList(ctx context.Context, codespaces []*api.Codespace) (
 	namesWithConflict := make(map[string]bool)
 	codespacesByName := make(map[string]codespaceWithIndex)
 	codespacesNames := make([]string, 0, len(codespaces))
+	codespacesDirty := make(map[string]bool)
 	for _, apiCodespace := range codespaces {
 		cs := codespace{apiCodespace}
 		csName := cs.displayName(false, false)
@@ -122,7 +167,14 @@ func chooseCodespaceFromList(ctx context.Context, codespaces []*api.Codespace) (
 
 				codespacesByName[fullDisplayName] = codespaceWithIndex{seenCodespace.cs, seenCodespace.idx}
 				codespacesNames[seenCodespace.idx] = fullDisplayNameWithGitStatus
-				delete(codespacesByName, csName) // delete the existing map entry with old name
+
+				// Update the git status dirty map to reflect the new name.
+				if seenCodespace.cs.hasUnsavedChanges() {
+					codespacesDirty[fullDisplayNameWithGitStatus] = true
+				}
+
+				// delete the existing map entry with old name
+				delete(codespacesByName, csName)
 
 				// All other codespaces with the same name should update
 				// to their specific name, this tracks conflicting names going forward
@@ -136,6 +188,10 @@ func chooseCodespaceFromList(ctx context.Context, codespaces []*api.Codespace) (
 
 		codespacesByName[csName] = codespaceWithIndex{cs, len(codespacesNames)}
 		codespacesNames = append(codespacesNames, displayNameWithGitStatus)
+
+		if cs.hasUnsavedChanges() {
+			codespacesDirty[displayNameWithGitStatus] = true
+		}
 	}
 
 	csSurvey := []*survey.Question{
@@ -160,8 +216,26 @@ func chooseCodespaceFromList(ctx context.Context, codespaces []*api.Codespace) (
 	// Codespaces are indexed without the git status included as compared
 	// to how it is displayed in the prompt, so the git status symbol needs
 	// cleaning up in case it is included.
-	selectedCodespace := strings.Replace(answers.Codespace, gitStatusDirty, "", -1)
+	selectedCodespace := answers.Codespace
+	isDirty := codespacesDirty[selectedCodespace]
+	if isDirty {
+		selectedCodespace = withoutGitStatus(answers.Codespace)
+	}
 	return codespacesByName[selectedCodespace].cs.Codespace, nil
+}
+
+// withoutGitStatus returns the string without the git status symbol.
+func withoutGitStatus(cname string) string {
+	return replaceLastOccurence(cname, gitStatusDirty, "")
+}
+
+// replaceLastOccurence replaces the last occurence of a string with another string.
+func replaceLastOccurence(str, old, replace string) string {
+	i := strings.LastIndex(str, old)
+	if i == -1 {
+		return str
+	}
+	return str[:i] + replace + str[i+len(old):]
 }
 
 // getOrChooseCodespace prompts the user to choose a codespace if the codespaceName is empty.
@@ -256,7 +330,7 @@ func noArgsConstraint(cmd *cobra.Command, args []string) error {
 }
 
 func noopLogger() *log.Logger {
-	return log.New(ioutil.Discard, "", 0)
+	return log.New(io.Discard, "", 0)
 }
 
 type codespace struct {

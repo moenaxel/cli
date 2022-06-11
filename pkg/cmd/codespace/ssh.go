@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -59,7 +58,7 @@ func newSSHCmd(app *App) *cobra.Command {
 			$ gh codespace ssh
 
 			$ gh codespace ssh --config > ~/.ssh/codespaces
-			$ echo 'include ~/.ssh/codespaces' >> ~/.ssh/config
+			$ printf 'Match all\nInclude ~/.ssh/codespaces\n' >> ~/.ssh/config
 		`),
 		PreRunE: func(c *cobra.Command, args []string) error {
 			if opts.stdio {
@@ -116,36 +115,14 @@ func (a *App) SSH(ctx context.Context, sshArgs []string, opts sshOptions) (err e
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// While connecting, ensure in the background that the user has keys installed.
-	// That lets us report a more useful error message if they don't.
-	authkeys := make(chan error, 1)
-	go func() {
-		authkeys <- checkAuthorizedKeys(ctx, a.apiClient)
-	}()
-
 	codespace, err := getOrChooseCodespace(ctx, a.apiClient, opts.codespace)
 	if err != nil {
 		return err
 	}
 
-	liveshareLogger := noopLogger()
-	if opts.debug {
-		debugLogger, err := newFileLogger(opts.debugFile)
-		if err != nil {
-			return fmt.Errorf("error creating debug logger: %w", err)
-		}
-		defer safeClose(debugLogger, &err)
-
-		liveshareLogger = debugLogger.Logger
-		a.errLogger.Printf("Debug file located at: %s", debugLogger.Name())
-	}
-
-	session, err := codespaces.ConnectToLiveshare(ctx, a, liveshareLogger, a.apiClient, codespace)
+	session, err := startLiveShareSession(ctx, codespace, a, opts.debug, opts.debugFile)
 	if err != nil {
-		if authErr := <-authkeys; authErr != nil {
-			return authErr
-		}
-		return fmt.Errorf("error connecting to codespace: %w", err)
+		return err
 	}
 	defer safeClose(session, &err)
 
@@ -209,11 +186,10 @@ func (a *App) SSH(ctx context.Context, sshArgs []string, opts sshOptions) (err e
 	}
 }
 
-func (a *App) printOpenSSHConfig(ctx context.Context, opts sshOptions) error {
+func (a *App) printOpenSSHConfig(ctx context.Context, opts sshOptions) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var err error
 	var csList []*api.Codespace
 	if opts.codespace == "" {
 		a.StartProgressIndicatorWithLabel("Fetching codespaces")
@@ -254,7 +230,7 @@ func (a *App) printOpenSSHConfig(ctx context.Context, opts sshOptions) error {
 			if err != nil {
 				result.err = fmt.Errorf("error connecting to codespace: %w", err)
 			} else {
-				defer session.Close()
+				defer safeClose(session, &err)
 
 				_, result.user, err = session.StartSSHServer(ctx)
 				if err != nil {
@@ -343,7 +319,7 @@ func newCpCmd(app *App) *cobra.Command {
 	var opts cpOptions
 
 	cpCmd := &cobra.Command{
-		Use:   "cp [-e] [-r] <sources>... <dest>",
+		Use:   "cp [-e] [-r] [-- [<scp flags>...]] <sources>... <dest>",
 		Short: "Copy files between local and remote file systems",
 		Long: heredoc.Docf(`
 			The cp command copies files between the local and remote file systems.
@@ -368,6 +344,7 @@ func newCpCmd(app *App) *cobra.Command {
 			$ gh codespace cp -e README.md 'remote:/workspaces/$RepositoryName/'
 			$ gh codespace cp -e 'remote:~/*.go' ./gofiles/
 			$ gh codespace cp -e 'remote:/workspaces/myproj/go.{mod,sum}' ./gofiles/
+			$ gh codespace cp -e -- -F ~/.ssh/codespaces_config 'remote:~/*.go' ./gofiles/
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return app.Copy(cmd.Context(), args, opts)
@@ -392,7 +369,7 @@ func (a *App) Copy(ctx context.Context, args []string, opts cpOptions) error {
 	if opts.recursive {
 		opts.scpArgs = append(opts.scpArgs, "-r")
 	}
-	opts.scpArgs = append(opts.scpArgs, "--")
+
 	hasRemote := false
 	for _, arg := range args {
 		if rest := strings.TrimPrefix(arg, "remote:"); rest != arg {
@@ -440,7 +417,7 @@ type fileLogger struct {
 func newFileLogger(file string) (fl *fileLogger, err error) {
 	var f *os.File
 	if file == "" {
-		f, err = ioutil.TempFile("", "")
+		f, err = os.CreateTemp("", "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create tmp file: %w", err)
 		}

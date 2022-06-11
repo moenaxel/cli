@@ -14,10 +14,13 @@ import (
 	"github.com/cli/cli/v2/pkg/prompt"
 )
 
+const defaultSSHKeyTitle = "GitHub CLI"
+
 type iconfig interface {
 	Get(string, string) (string, error)
 	Set(string, string, string) error
 	Write() error
+	WriteHosts() error
 }
 
 type LoginOptions struct {
@@ -67,6 +70,7 @@ func Login(opts *LoginOptions) error {
 	}
 
 	var keyToUpload string
+	keyTitle := defaultSSHKeyTitle
 	if opts.Interactive && gitProtocol == "ssh" {
 		pubKeys, err := opts.sshContext.localPublicKeys()
 		if err != nil {
@@ -92,9 +96,18 @@ func Login(opts *LoginOptions) error {
 				return err
 			}
 		}
-	}
-	if keyToUpload != "" {
-		additionalScopes = append(additionalScopes, "admin:public_key")
+
+		if keyToUpload != "" {
+			err := prompt.SurveyAskOne(&survey.Input{
+				Message: "Title for your SSH key:",
+				Default: defaultSSHKeyTitle,
+			}, &keyTitle)
+			if err != nil {
+				return fmt.Errorf("could not prompt: %w", err)
+			}
+
+			additionalScopes = append(additionalScopes, "admin:public_key")
+		}
 	}
 
 	var authMode int
@@ -173,7 +186,7 @@ func Login(opts *LoginOptions) error {
 		fmt.Fprintf(opts.IO.ErrOut, "%s Configured git protocol\n", cs.SuccessIcon())
 	}
 
-	err := cfg.Write()
+	err := cfg.WriteHosts()
 	if err != nil {
 		return err
 	}
@@ -186,7 +199,7 @@ func Login(opts *LoginOptions) error {
 	}
 
 	if keyToUpload != "" {
-		err := sshKeyUpload(httpClient, hostname, keyToUpload)
+		err := sshKeyUpload(httpClient, hostname, keyToUpload, keyTitle)
 		if err != nil {
 			return err
 		}
